@@ -1,0 +1,232 @@
+Build ASBS so no external API call happens unless the user clicks. When the user does click, fetch only what’s needed, filter by state-accessible sportsbooks, and return the single highest locked-profit arbitrage (plus a ranked list). Include an Estimate → Confirm step before every external call sequence to save credits.
+
+0) Guardrails
+
+No background polling. No timers. Every external call is user-triggered.
+
+Credit-aware flow: Always show an Estimate modal (planned endpoints + rough request count) and require Confirm before executing.
+
+State filtering is mandatory before any arbitrage calculation.
+
+Read ODDS_API_KEY from env; never hardcode. If absent, show a setup banner.
+
+Heavy features (historical/props/extra regions) are behind feature flags and only run on click.
+
+1) UI (Buttons = Calls)
+
+Sticky filters (no network): State(s) (required), Sport(s) (chips; default “All”), Regions (default us,us2), Markets (default h2h,spreads,totals), Min Profit % (default 1).
+Buttons (each is a single action with Estimate → Confirm → Execute):
+
+Estimate Credit Use (no network): Show which endpoints would be hit given current filters + a rough request count. Present Run Now to confirm or Cancel.
+
+Scan Arbitrage Now (network on confirm): One-shot odds fetch for current filters → compute & display ranked arbs; spotlight Max Profit Pick on top.
+
+View Event Details (per row; network on confirm): Fetch that event’s latest extended markets (one-shot drill-down).
+
+Backfill Historical (Range) (network on confirm): Timestamp-paged historical pulls; resumable; can Pause.
+
+Export Results (no network).
+
+Update State Map (no network; admin).
+
+Test Notifications (no network by default).
+
+Never auto-refresh. If results exist and filters haven’t changed within N minutes, show “Use Cached Results?” with a Refresh Anyway button.
+
+2) Odds API — Practical Cheat Sheet (for the agent)
+
+Use these canonical endpoints and params. Build small, testable request helpers. Normalize prices to decimal internally.
+
+Base
+
+Base URL: https://api.the-odds-api.com/v4/
+
+Auth param: apiKey=<ODDS_API_KEY> (query)
+
+Common query params:
+
+regions: comma list; default our app uses us,us2 (optionally uk,eu,au behind a flag)
+
+markets: comma list; defaults h2h,spreads,totals (featured). Extended markets come from event endpoints.
+
+oddsFormat: american or decimal (we’ll request american and convert internally)
+
+dateFormat: iso
+
+Optional narrowing: bookmakers=<book_key_1,book_key_2,...> (use only if user has narrowed state → books sufficiently)
+
+Quota/usage headers to log on every response (names may vary by deployment; capture what’s present):
+
+x-requests-used, x-requests-remaining (or similar). Persist the last-seen values and display in UI footer.
+
+Enumerate sports (in-season)
+
+GET /sports?apiKey=…
+
+Returns array of sports with keys (e.g., americanfootball_nfl, basketball_nba, …) and active flag.
+
+Note: Only in-season sports show as active; for historical pulls, keep a manual allowlist to include off-season sport keys.
+
+Live & Upcoming odds (featured markets)
+
+GET /sports/{sport_key}/odds?apiKey=…&regions=us,us2&markets=h2h,spreads,totals&oddsFormat=american&dateFormat=iso
+
+Returns events → bookmakers → markets → outcomes with prices.
+
+Use this for first-pass scans (cheap, broad coverage).
+
+Event-level odds (extended markets, incl. alternates/props)
+
+GET /sports/{sport_key}/events/{event_id}/odds?apiKey=…&regions=us,us2&markets=<extended list>&oddsFormat=american
+
+Use only when the user opens an event detail (click).
+
+Extended markets: e.g., alternate totals, team totals, selected player props (behind flag). Keep the list configurable.
+
+Historical odds (timestamp-paged)
+
+Market-level (featured markets only):
+GET /historical/sports/{sport_key}/odds?apiKey=…&regions=…&markets=h2h,spreads,totals&dateFormat=iso&oddsFormat=american&from=<ISO>&to=<ISO>&page=<n>
+
+Event-level (extended allowed):
+GET /historical/sports/{sport_key}/events/{event_id}/odds?apiKey=…&regions=…&markets=<…>&from=<ISO>&to=<ISO>&page=<n>
+
+These calls are more expensive; estimate requests carefully.
+
+Implement timestamp window paging (iterate page or provided cursors) until the range is covered.
+
+Respect rate limits; pause if x-requests-remaining falls below threshold.
+
+Error handling & backoff (all endpoints)
+
+4xx: validate params; show user a helpful message (e.g., invalid sport key, missing markets).
+
+429: exponential backoff; advise user to narrow filters or try later.
+
+5xx: brief retry then surface error with “Retry” button.
+
+Always log: endpoint, params summary, status, duration, used/remaining headers.
+
+3) State Filtering (must happen before arb math)
+
+Maintain StateMap: state_code → [book_keys] (editable in Admin).
+
+After fetching odds, discard any bookmaker not present in ALL selected states (or if multi-state OR logic is desired, use the specified rule; default AND).
+
+Only pass state-eligible quotes into the arbitrage engine.
+
+4) Arbitrage Objective (maximize locked profit)
+
+Normalize odds to decimal internally (convert from American).
+
+For each event/market:
+
+For each outcome, select the best price among state-eligible bookmakers.
+
+Compute S = Σ (1 / price_best_i). If S < 1 − buffer, arbitrage exists.
+
+Compute stake fractions f_i = (1/price_best_i) / S.
+
+Apply bankroll cap / min-max stake constraints if provided, and smart rounding.
+
+Compute locked profit % and present a stake plan.
+
+Rank opportunities by locked profit % (desc) and visually feature the Max Profit Pick.
+
+5) Click → Plan → Confirm → Execute
+
+Plan (no network): Based on current filters, list the exact endpoints that will be called, with a conservative request count estimate:
+
+sports enumeration (only when the user clicks “Refresh Sports List”)
+
+odds calls per selected sport (and per region/market combination)
+
+per-event extended odds (only for event detail clicks)
+
+historical pages (timestamp windows)
+
+Show projected credits and a Run Now button.
+
+Execute: When confirmed, perform calls; stream results into the UI; log headers.
+
+Credit-savvy patterns
+
+Default to featured markets only for the first pass.
+
+Only call event-level odds on explicit event clicks.
+
+Offer Use Cached Results if filters unchanged within cache_ttl_minutes.
+
+Offer Narrow by Bookmakers (optional) to lower call counts.
+
+Historical runs are chunked and resumable (with Pause).
+
+6) Internal Models (minimal set)
+
+Sport: id, name, code
+
+League: id, name, sport_id
+
+Event: id, league_id, sport_id, start_time, status, teams, external_ids
+
+Market: id, event_id, type, outcomes[]
+
+Quote: event_id, market_id, outcome_id, book_key, region, price_decimal, price_american, ts
+
+ArbOpportunity: event_id, market_id, legs[{book, outcome, price, stake_fraction}], profit_pct, validity_hint
+
+StateMap: state_code → [book_keys]
+
+RequestLog: ts, endpoint, params_summary, used, remaining, duration_ms
+
+7) App Endpoints (app’s own API)
+
+POST /estimate → given filters, returns planned calls + estimated request count (no network).
+
+POST /scan/arbs → given filters, runs one-shot featured markets fetch and returns ranked arbs + Max Profit Pick.
+
+GET /events/{id}/detail → fetch extended markets for that event (one click).
+
+POST /historical/backfill → chunked timestamp-paged pulls (on confirm).
+
+GET /state-map / PUT /state-map → manage book accessibility by state.
+
+GET /cache/status / POST /cache/clear.
+
+8) UX Must-Haves
+
+Top Max Profit card: event, sport, market, books used, stake plan, locked profit %.
+
+Arb table: Sport | Event | Market | Books | Profit % | “Show Stakes” | “Details”.
+
+Estimate modal: shows endpoints, counts, tips to reduce calls (fewer sports/regions/markets).
+
+Footer credit meter: last-seen used/remaining from headers.
+
+Empty state: “No calls are made until you click Scan Arbitrage Now.”
+
+9) Tests
+
+No network until user hits Estimate → Run Now.
+
+State filter prunes books before arb math.
+
+Ranking returns the true max profit for known fixtures.
+
+Cache reuse path makes zero calls.
+
+Historical paging resumes and stops cleanly when paused or range completed.
+
+Error/backoff logic surfaces clear next steps.
+
+10) Config (env/flags)
+
+ODDS_API_KEY (required).
+
+Defaults: regions = us,us2, markets = h2h,spreads,totals, arb_buffer = 0.01, cache_ttl_minutes = 10.
+
+Flags: enableProps, enableHistorical, enableExtraRegions.
+
+Credit thresholds: warn when remaining < configurable N.
+
+Deliver exactly this flow: Users must click to plan and confirm before any call is made. Fetch only what the user asked for, filter by state-accessible books, and output the maximum locked-profit arbitrage first—while transparently tracking and conserving API credits.
